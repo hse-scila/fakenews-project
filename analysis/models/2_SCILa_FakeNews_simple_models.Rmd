@@ -1,0 +1,459 @@
+---
+title: "SCILa Cross-Country FakeNews Project: simple models"
+author:  "SCILa Team"
+date: "2021-09-06 `r format(Sys.time())`"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    code_folding: hide
+    toc_float: yes
+    df_print: paged
+    fig_width: 7
+    fig_height: 6
+    fig_caption: true
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+editor_options:
+  chunk_output_type: console
+---
+
+# SCILa Team
+
+The script documents the analysis of the cross-country fake news project by the team of the Laboratory for Social and Cognitive Informatics ([**SCILa**](https://scila.hse.ru/en/)), National Research University Higher School of Economics, Saint-Petersburg, Russia (laboratory head: Olessia Koltsova).
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(arrow)
+library(lme4)
+library(ggeffects)
+library(tidyverse) 
+library(magrittr)
+library(broom.mixed)
+library(cowplot)
+library(sjPlot)
+
+theme_set(theme_bw(base_size=12))
+```
+
+# Preprocessing
+
+```{r message=FALSE} 
+# Wide format: with all his/her answers in columns
+# Long format: one answer is one instance (one row)
+
+df_wide = read_parquet("data/data_clean_14_11_20.parquet", compression = "uncompressed")
+
+df_wide %<>% mutate(
+    Subj = as_factor(id),
+    Edu = as.integer(factor(education_text, levels = c(
+      "Закончил(-а) школу",
+      "Закончил(-а) техникум, колледж, ПТУ",
+      "Другое",
+      "Учусь в университете/институте",
+      "Высшее",            
+      "Имею ученую степень"), ordered = T)),
+    Gen = factor(gender_text),
+    Gen = fct_recode(Gen, 
+                      M = "\u0416\u0435\u043d\u0441\u043a\u0438\u0439",
+                      F = "\u041c\u0443\u0436\u0441\u043a\u043e\u0439"),
+    SNS = as_factor(sns),
+    C_set = as_factor(country_set),
+    P_int = as_factor(politics_interest),
+    p_sup = politics_loyal,
+    P_sup = as_factor(p_sup),
+    p_hel = people_help,  
+    p_tru = people_trust,
+    p_use = people_use,
+    See = rowSums(across(matches("news[2-9]_seen"))),
+    Che = rowSums(across(matches("news[2-9]_checked"))),
+    # ... experimental design variables
+    # Dependent variables
+    consp = (consp_truth+consp_strange)/2 -3,
+    accuracy = rowSums(across(matches("news[2-9]_alright"))),
+    accuracy_fake = rowSums(
+      (across(matches("news[2-9]_alright")) == 1) & (across(matches("news[2-9]_answer")) <= 3)),
+    accuracy_truth = rowSums(
+      (across(matches("news[2-9]_alright")) == 1) & (across(matches("news[2-9]_answer")) > 3)),
+    FP = rowSums(
+      (across(matches("news[2-9]_answer")) > 3) & (across(matches("news[2-9]_alright")) == 0)
+    ),
+    FN = rowSums(
+      (across(matches("news[2-9]_answer")) <= 3) & (across(matches("news[2-9]_alright")) == 0)
+    ),
+    conf = rowSums(
+      ceiling(abs(across(matches("news[2-9]_answer")) - 3.5)) - 1
+    ),                   # confidence is an ordinal variable (0-2)
+    bias = FP - FN,
+    s1 = p_sup - 3,      # good reference category
+    a1 = age - 35,
+    vkfriends_native = case_when(
+      country_text == 'ru' ~ vkfriends_ru,
+      country_text == 'ua' ~ vkfriends_ua,
+      country_text == 'kz' ~ vkfriends_kz,
+    ),
+    vkfriends_abroad = case_when(
+      country_text == 'ru' ~ vkfriends - vkfriends_ru,
+      country_text == 'ua' ~ vkfriends - vkfriends_ua,
+      country_text == 'kz' ~ vkfriends - vkfriends_kz,
+    ),
+)
+
+df_long = read_parquet("data/data_clean_14_11_20_REM.parquet", compression = "uncompressed")
+
+df_long_post <- 
+  df_long %>% 
+  filter(balanced == 1) %>% 
+  mutate(
+# Random factors
+         Subj = as_factor(id),
+         Item = as_factor(news_jid),
+# Covariates
+# ... (subset of) secondary theoretical moderator or control variables
+         Edu = as_factor(education_text),
+         Gen = as_factor(gender_text),
+         Gen = fct_recode(Gen, 
+                            M = "\u0416\u0435\u043d\u0441\u043a\u0438\u0439",
+                            F = "\u041c\u0443\u0436\u0441\u043a\u043e\u0439"),
+         SNS = as_factor(sns),
+         conf = ceiling(abs(news_answer - 3.5)) - 1,
+         C_set = as_factor(country_set),
+         P_int = politics_interest,
+         p_sup = politics_loyal,
+         P_sup = as_factor(p_sup),
+         P_rel = politics_relations,
+         p_hel = people_help,  
+         p_tru = people_trust,
+         p_use = people_use,
+         Believe = as_factor(news_believe),
+         See = as_factor(news_seen),
+         Che = as_factor(news_checked),
+         UserCountry = as_factor(news_country),
+         NewsCountry = as_factor(news_target_country),
+         Language = as_factor(news_language),
+# ... experimental design variables
+         UNL = as_factor(paste(UserCountry, NewsCountry, Language)),
+         UNL = fct_relevel(UNL, "ru kz ru", after=1),     # important for contrasts
+         Source = as_factor(news_source),                 # within-Subj/within-Item
+         Source = fct_recode(Source, UC = "1", NC = "0"),
+         Truth = as_factor(news_truth),                   # within-Subj/between-Item
+         Nrtv = as_factor(news_frame),                   # within-Subj/between-Item
+         Nrtv = fct_recode(Nrtv, D = "1", A = "0"),
+# Dependent variables
+         answer = news_answer,
+         time = log(news_time),
+         consp = (consp_truth+consp_strange)/2 -3, # conspiracy scale - centered
+         vkfriends_native = case_when(
+           country_text == 'ru' ~ vkfriends_ru,
+           country_text == 'ua' ~ vkfriends_ua,
+           country_text == 'kz' ~ vkfriends_kz,
+         ),
+         vkfriends_abroad = case_when(
+           country_text == 'ru' ~ vkfriends - vkfriends_ru,
+           country_text == 'ua' ~ vkfriends - vkfriends_ua,
+           country_text == 'kz' ~ vkfriends - vkfriends_kz,
+         ),
+  )
+
+df_long_post %>% select(Item) %>% nlevels()
+
+df_long_post %<>% 
+  filter(!is.na(p_sup)) %>% 
+  mutate(
+    s1 = p_sup - 3,      # good reference category
+    a1 = age - 35,       # median of age
+  )
+
+levels(df_long_post$Edu) <- 1:6
+```
+
+# Building models
+
+## Null model
+
+```{r eval=FALSE, echo=TRUE}
+# Нулевая модель для доверия новости
+m_null <- lmer(answer ~ 1 + (1 | Subj) + (1 | Item), 
+               data=df_long_post, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+
+summary(m_null)
+performance::icc(m_null)
+# ICC = 0.132
+
+# Нулевая модель для распознаваемости новости
+m_null_alright <- lmer(news_alright ~ 1 + (1 | Subj) + (1 | Item), 
+               data=df_long_post, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+
+summary(m_null_alright)
+performance::icc(m_null_alright)
+# ICC = 0.097
+
+# Нулевая модель для уверенности респондента
+m_null_conf <- lmer(conf ~ 1 + (1 | country_text) + (1 | sns), 
+               data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+
+summary(m_null_conf)
+performance::icc(m_null_conf)
+# ICC = 0.019
+
+# Нулевая модель для уверенности респондента (на длинных данных)
+m_null_conf_long <- lmer(conf ~ 1 + (1 | Subj) + (1 | Item), 
+               data=df_long_post, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+
+summary(m_null_conf_long)
+performance::icc(m_null_conf_long)
+# ICC = 0.571
+```
+
+
+```{r eval=FALSE, echo=TRUE}
+# Доверие
+m_cred <- lmer(answer ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          (0 + Nrtv + Truth + See + Che | Subj) +
+                          (1 + s1 + Gen + See + Che | Item), 
+                 data=df_long_post, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+# Модель на подвыборке VK
+m_cred_vk <- lmer(answer ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          vkcomments + vkposts + vkrepostsbyuser + 
+                          vkfriends_native + vkfriends_abroad +
+                          vkfriends_ua + vkfriends_na + vkfriends_ru + vkfriends_kz + vkfriends_other +
+                          (1 + Truth + See + Che | Subj) +
+                          (1 | Item), 
+                 data=df_long_post %>% filter(sns == 'VK'), REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(m_cred_vk)
+write_rds(m_cred_vk, "simple_models_vk/model_cred.Rds", compress = "gz")
+
+
+# Модель на подвыборке VK RU
+m_cred_vk_ru <- lmer(answer ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          vkcomments + vkposts + vkrepostsbyuser + 
+                          vkfriends_native + vkfriends_abroad +
+                          vkfriends_ua + vkfriends_na + vkfriends_kz + vkfriends_other +
+                          (1 + Truth + See + Che | Subj) +
+                          (1 | Item), 
+                 data=df_long_post %>% filter(sns == 'VK', country_text == 'ru'),
+                 REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(m_cred_vk_ru)
+write_rds(m_cred_vk, "simple_models_vk/model_cred_RU.Rds", compress = "gz")
+
+```
+
+```{r eval=FALSE, echo=TRUE}
+# Распознаваемость новости: совпадение метки испытуемого с меткой текста TRUE/FALSE
+# Переменная: news_alright
+m_alright <- lmer(news_alright ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          (0 + Nrtv + Truth + See | Subj) +
+                          (1 + Gen + See + Che | Item), 
+                 data=df_long_post, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+summary(m_alright)
+write_rds(m_alright, "simple_models/model_news_alright.Rds", compress = "gz")
+tab_model(m_alright, file="simple_models/tables/model_news_alright.html", digits = 3, digits.re = 3)
+
+# Модель на подвыборке VK
+m_alright_vk <- lmer(news_alright ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          vkcomments + vkposts + vkrepostsbyuser + 
+                          vkfriends_native + vkfriends_abroad +
+                          vkfriends_ua + vkfriends_na + vkfriends_ru + vkfriends_kz + vkfriends_other +
+                          (1 + Truth + See + Che | Subj) +
+                          (1 | Item), 
+                 data=df_long_post %>% filter(sns == 'VK'),
+                 REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(m_alright_vk)
+write_rds(m_alright_vk, "simple_models_vk/model_news_alright.Rds", compress = "gz")
+
+# Модель на подвыборке VK RU
+m_alright_vk_ru <- lmer(news_alright ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          vkcomments + vkposts + vkrepostsbyuser + 
+                          vkfriends_native + vkfriends_abroad +
+                          vkfriends_ua + vkfriends_na + vkfriends_kz + vkfriends_other +
+                          (1 + Truth + See + Che | Subj) +
+                          (1 | Item), 
+                 data=df_long_post %>% filter(sns == 'VK', country_text == 'ru'),
+                 REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(m_alright_vk_ru)
+write_rds(m_alright_vk_ru, "simple_models_vk/model_news_alright.Rds", compress = "gz")
+
+```
+
+
+```{r eval=FALSE, echo=TRUE}
+# Точность пользователя: количество правильных ответов испытуемого
+# Переменная: accuracy
+m_acc <- lmer(accuracy ~  1 + s1 + 
+                          news_freq_read + news_freq_check + politics_interest +
+                          people_help + people_trust + people_use +
+                          news_sources_sns +
+                          vkfriends +
+                          # + vkcomments + vkposts + vkrepostsbyuser + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          (1 | country_text),
+                 data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+m_acc
+summary(m_acc)
+write_rds(m_acc, "simple_models/model_accuracy.Rds", compress = "gz")
+tab_model(m_acc, file="simple_models/tables/model_accuracy.html", digits = 3, digits.re = 3)
+```
+
+
+```{r eval=FALSE, echo=TRUE}
+# Умение видеть ложь: количество ложноположительных ошибок пользователя (FP);
+# значения: 0-4 ordinal (FP = ложь принимается за правду)
+m_fp <- lmer(FP ~ 1 + s1 +
+                  news_freq_read + news_freq_check + politics_interest +
+                  people_help + people_trust + people_use +
+                  news_sources_sns +
+                  #vkfriends + vkcomments + vkposts + vkrepostsbyuser + 
+                  a1 + Gen + Edu + See + Che + consp +
+                  (1 | country_text),
+             data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+m_fp
+summary(m_fp)
+write_rds(m_fp, "simple_models/model_falsepos.Rds", compress = "gz")
+tab_model(m_fp, file="simple_models/tables/model_falsepos.html")
+
+# Модели для сети VK
+m_fp_vk <- lmer(FP ~ 1 + s1 +
+                  news_freq_read + news_freq_check + politics_interest +
+                  people_help + people_trust + people_use +
+                  news_sources_sns +
+                  vkcomments + vkposts + vkrepostsbyuser + 
+                  vkfriends_native + vkfriends_abroad +
+                  vkfriends_ua + vkfriends_na + vkfriends_kz + vkfriends_other +
+                  a1 + Gen + Edu + See + Che + consp +
+                  (1 | country_text),
+             data=df_wide %>% filter(sns == 'VK'), REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+summary(m_fp_vk)
+write_rds(m_fp_vk, "simple_models_vk/model_falsepos.Rds", compress = "gz")
+
+m_fp_vk_ru <- lm(FP ~ 1 + s1 +
+                  news_freq_read + news_freq_check + politics_interest +
+                  people_help + people_trust + people_use +
+                  news_sources_sns +
+                  vkcomments + vkposts + vkrepostsbyuser + 
+                  vkfriends_native + vkfriends_abroad +
+                  vkfriends_ua + vkfriends_na + vkfriends_kz +
+                  a1 + Gen + Edu + See + Che + consp,
+             data=df_wide %>% filter(sns == 'VK', country_text == 'ru'))
+summary(m_fp_vk_ru)
+write_rds(m_fp_vk_ru, "simple_models_vk/model_falsepos_RU.Rds", compress = "gz")
+
+```
+
+
+```{r eval=FALSE, echo=TRUE}
+# Умение видеть правду: количество ложноотрицательных ошибок пользователя;
+# значения (FN): 0-4 ordinal (FN = правда принимается за ложь)
+m_fn <- lmer(FN ~ 1 + s1 + 
+                  news_freq_read + news_freq_check + politics_interest +
+                  people_help + people_trust + people_use +
+                  news_sources_sns +
+                  #vkfriends + vkcomments + vkposts + vkrepostsbyuser + 
+                  a1 + Gen + Edu + See + Che + consp +
+                  (1 | country_text),
+             data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+m_fn
+summary(m_fn)
+write_rds(m_fn, "simple_models/model_falseneg.Rds", compress = "gz")
+tab_model(m_fn, file="simple_models/tables/model_falseneg.html")
+
+# Модели для сети VK
+m_fn_vk <- lmer(FN ~ 1 + s1 +
+                  news_freq_read + news_freq_check + politics_interest +
+                  people_help + people_trust + people_use +
+                  news_sources_sns +
+                  vkcomments + vkposts + vkrepostsbyuser + 
+                  vkfriends_native + vkfriends_abroad +
+                  vkfriends_ua + vkfriends_na + vkfriends_kz + vkfriends_other +
+                  a1 + Gen + Edu + See + Che + consp +
+                  (1 | country_text),
+             data=df_wide %>% filter(sns == 'VK'), REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+summary(m_fn_vk)
+write_rds(m_fn_vk, "simple_models_vk/model_falseneg.Rds", compress = "gz")
+
+m_fn_vk_ru <- lm(FN ~ 1 + s1 +
+                  news_freq_read + news_freq_check + politics_interest +
+                  people_help + people_trust + people_use +
+                  news_sources_sns +
+                  vkcomments + vkposts + vkrepostsbyuser + 
+                  vkfriends_native + vkfriends_abroad +
+                  vkfriends_ua + vkfriends_na + vkfriends_kz +
+                  a1 + Gen + Edu + See + Che + consp,
+             data=df_wide %>% filter(sns == 'VK', country_text == 'ru'))
+summary(m_fn_vk_ru)
+write_rds(m_fn_vk_ru, "simple_models_vk/model_falseneg_RU.Rds", compress = "gz")
+```
+
+
+```{r eval=FALSE, echo=TRUE}
+# Баланс умений видеть правду и ложь пользователя, или баланс
+# доверчивости-подозрительности
+# Bias = FP - FN; значения (-4…+4)
+m_bias <- lmer(bias ~ 1 + s1 +
+                      news_freq_read + news_freq_check +
+                      politics_interest + politics_relations +
+                      people_help + people_trust + people_use +
+                      news_sources_tv + news_sources_newspapers + news_sources_radio + news_sources_sns +
+                      news_sources_bloggers + news_sources_newsaggregators + news_sources_friends +
+                      # news_sources_other + 
+                      # vkfriends + vkcomments + vkposts + vkrepostsbyuser + 
+                      a1 + Gen + Edu + See + Che + consp +
+                      (1 | country_text),
+             data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+hist(df_wide$bias)
+m_bias_step_result = cAIC4::stepcAIC(m_bias, data=trace=T, numCores=14)
+summary(m_bias)
+write_rds(m_bias, "simple_models/model_bias.Rds", compress = "gz")
+tab_model(m_bias, file="simple_models/tables/model_bias.html", digits = 3, digits.re = 3)
+```
+
+```{r eval=FALSE, echo=TRUE}
+# Уверенность пользователя (на широких данных)
+## Начальная модель
+m_conf <- lmer(conf ~ 1 + s1 +
+                      news_freq_read + news_freq_check + politics_interest +
+                      people_help + people_trust + people_use +
+                      news_sources_sns +
+                      #vkfriends + vkcomments + vkposts + vkrepostsbyuser + 
+                      a1 + Gen + Edu + See + Che + consp +
+                      (1 | country_text) + (1 | sns),
+             data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+summary(m_conf)
+
+## Оптимизированная модель
+m_conf2 <- lmer(conf ~ 1 + 
+                      news_freq_read + news_freq_check + politics_interest +
+                      people_help + people_trust + people_use +
+                      news_sources_sns +
+                      #vkfriends + vkcomments + vkposts + vkrepostsbyuser + 
+                      a1 + Gen + Edu + consp +
+                      (1 | country_text) + (1 | sns),
+             data=df_wide, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+summary(m_conf2)
+
+# Уверенность пользователя (на "длинных" данных)
+m_conf_long <- lmer(conf ~ 1 + UNL + Nrtv + Truth + Source + s1 + 
+                          a1 + Gen + Edu + See + Che + consp +
+                          news_freq_read + P_int +
+                          (1 + Truth + See + Che | Subj) +
+                          (1 | Item), 
+                 data=df_long_post, REML=FALSE, control=lmerControl(calc.derivs=FALSE))
+summary(m_conf_long)
+performance::icc(m_conf_long)
+write_rds(m_conf_long, "simple_models/model_conf.Rds", compress = "gz")
+tab_model(m_conf_long, file="simple_models/tables/model_conf.html", digits = 3, digits.re = 3)
+```

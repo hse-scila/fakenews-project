@@ -1,0 +1,1243 @@
+---
+title: "SCILa Cross-Country FakeNews Project #1"
+author:  "SCILa Team"
+date: "2021-05-18 `r format(Sys.time())`"
+output:
+  html_document:
+    number_sections: yes
+    toc: yes
+    toc_depth: 3
+    code_folding: hide
+    toc_float: yes
+  word_document:
+    toc: yes
+    toc_depth: '3'
+  pdf_document:
+    toc: yes
+    toc_depth: '3'
+editor_options:
+  chunk_output_type: console
+---
+
+# SCILa Team
+
+The script documents the analysis of the cross-country fake news project by the team of the Laboratory for Social and Cognitive Informatics ([**SCILa**](https://scila.hse.ru/en/)), National Research University Higher School of Economics, Saint-Petersburg, Russia (laboratory head: Olessia Koltsova).
+
++ Kirill Bryanov       [0000-0001-7992-2216]
++ Reinhold Kliegl      [0000-0002-0180-8488]
++ Olessia Koltsova     [0000-0002-2669-3154]
++ Sergey Koltcov       [0000-0002-2932-2746]
++ Alexander Porshnev   [0000-0002-0075-1061] 
++ Yadviga Sinyavskaya  [0000-0003-2385-3295]
++ Maxim Terpilovskii   [0000-0003-2586-4633]
++ Victoria Vziatysheva [0000-0002-3762-6758]
+
+# To Do and revision history
+
+**To do**
+
++ Plot with LMM partial effects; scatter for H3
++ Residual plots
++ Caterpillar plots for VCs
++ Post-hoc LMM for `P_int`, `p_hel`, `p_tru`, and `p_use` 
++ Post-hoc LMM for `SNS` (i.e., FB vs. VK)
+
+**Done**
+
++
++ 
+
+# Setup
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(arrow)
+library(summarytools)
+library(lme4)
+library(remef)
+library(ggeffects)
+library(tidyverse) 
+library(magrittr)
+library(broom.mixed)
+library(cowplot)  
+
+theme_set(theme_bw(base_size=12))
+```
+
+# Preprocessing
+
+```{r message=FALSE} 
+# Block for Reinhold Kliegl main code
+# Dataset without "REM" substring: one instance is one respondent
+# ... wide format -- with all his/her answers in columns
+# df_wide = read_parquet("data/data_clean_14_11_20.parquet")
+
+# Dataset with "REM": one instance (i.e. one row in a dataframe) is  one news item that was shown to a respondent
+# ... long format
+#setwd("C:\\Alex\\Проекты\\!Основная\\LINIS\\РНФ\\Основной анализ данных\\Kliegl")
+
+df <- 
+  read_parquet("data/data_clean_14_11_20_REM.parquet", compression = "uncompressed") %>% 
+  filter (balanced == 1) %>% 
+  mutate(
+# Random factors
+         Subj = as_factor(id),
+         Item = as_factor(news_jid),
+# Covariates
+# ... (subset of) secondary theoretical moderator or control variables
+         age = age,
+         Edu = as_factor(education_text),
+         Gen = as_factor(gender_text),
+         Gen = fct_recode(Gen, 
+                            M = "\u0416\u0435\u043d\u0441\u043a\u0438\u0439",
+                            F = "\u041c\u0443\u0436\u0441\u043a\u043e\u0439"),
+         SNS = as_factor(sns),
+         C_set = as_factor(country_set),
+         P_int = as_factor(politics_interest),
+         p_loy = politics_loyal,
+         P_loy = as_factor(politics_loyal),
+         p_hel = people_help,  
+         p_tru = people_trust,
+         p_use = people_use,
+         Believe = as_factor(news_believe),
+         See = as_factor(news_seen),
+         Che = as_factor(news_checked),
+         UserCountry = as_factor(news_country),
+         NewsCountry = as_factor(news_target_country),
+         Language = as_factor(news_language),
+# ... experimental design variables
+         UNL = as_factor(paste(UserCountry, NewsCountry, Language)),
+         UNL = fct_relevel(UNL, "ru kz ru", after=1),     # important for contrasts
+         Source = as_factor(news_source),                 # within-Subj/within-Item
+         Source = fct_recode(Source, UC = "1", NC = "0"),
+         Truth = as_factor(news_truth),                   # within-Subj/between-Item
+         Frame = as_factor(news_frame),                   # within-Subj/between-Item
+         Frame = fct_recode(Frame, D = "1", A = "0"),
+# Dependent variables
+         answer = news_answer,
+         accuracy = news_alright,
+         time = log(news_time)
+         ) %>% 
+  dplyr::select(Subj, Item, age,  Gen, Edu, See, Che, SNS, P_int, p_hel, p_tru, p_use, 
+                p_loy, UNL, Frame, Truth, Source, answer, accuracy, time)
+
+levels(df$Edu) <- 1:6 # default labels generate problem with lmer() output
+#1 - I graduated from a technical school, college, vocational school 
+#2 - I graduated with a degree of higher education 
+#3 - I study at a university / institute   
+#4 - I graduated from school 
+#5 - I have an academic degree
+#6 - Other 
+
+# Check levels of UNL
+#levels(df$UNL)
+```
+
+# Theoretical focus
+
+The theoretical focus is on the following variables (and their interactions): 
+
++ `UNL`    : Four contrasts defined for five groups of subjects varying between and within countries
++ `Frame`  : Agreement with dominant narrative or alternative narrative of residents' country
++ `p_loc_c`: Subjects' self-rated political loyality (centered)
++ `Truth  `: True vs. fabricated events (true vs. fake news)
++ `Source` : Item presented as being from a local or a foreign news media
+
+# Relevant covariates
+
+The following covariates are included as possible moderators of the theoretically expected effects:
+
++ `age_c`: age (centered)
++ `Gen`  : Gender
++ `Edu`  : Educational status
++ `See`  : Was the item judged as "seen"?
++ `Che`  : Was the item checked in the internet?
+
+`See`(n) and `Che`(checked) are needed because they allow us to control for the "contamination" of ratings by knowledge. Strictly speaking the cleanest test of the hypotheses would restrict the analysis to fabricated news. However, this would cause a dramatic loss of statistical power. 
+
+These covariates are not in the theoretical focus of this paper. We check simple interactions with the theoretically motivated variables to test their potential relevance. Inclusion in the LMM depends on there significance.
+
+# Setting the contrasts for factors and reference values for covariates  
+
+Here is a quite comprehensive discussion in favor of _demeaning_ covariates:   
+https://easystats.github.io/parameters/reference/demean.html
+
++ See next R-code chunk for details on contrasts for `UNL` and other factors of the experimental design.
++ We center `p_loy` at 3 because this is an interpetable value that can be used across experiments. When used in combination with contrasts that return the `GM` in the intercept, the intercept estimates the `GM` for a rating of 3. Centering at mean or median renders the estimates dependent on the specific sample of subjects and experimental conditions. 
++ We center `age`  at 35, based on inspection of distribution.
++ We use a sum contrast for other factors.  
+
+```{r}
+df <- 
+  df %>% 
+  filter(!is.na(p_loy)) %>% 
+  mutate(p_loy_c = p_loy - 3,      # good reference category
+         age_c = age - 35          # median of age
+         )
+
+# NOT USED: Orthogonal set of contrasts based on Olessia's contrast (in principle) 
+orth_contr.UNL <- matrix(c( -3, -3,  2,  2,  2,   # H2: Conflict vs. no conflict  
+                             1, -1,  0,  0,  0,   # H3: KZ-RU-RU vs RU-KZ-RU 
+                             0,  0,  2, -1, -1,   # H4: RU-UA-RU vs. (UA-RU-RU + UA-RU-UA)       
+                             0,  0,  0,  1, -1),  # H5: RU vs. UA language x frame for UA users
+                          ncol = 4)
+cor(orth_contr.UNL) # to see correlation
+
+# USED: Non-orthogonal set of contrasts; imbalance in design induces r's, too.
+levels(df$UNL) # check (current) order of factor levels before contrast definition
+contr.UNL <- matrix(c( -3, -3,  2,  2,  2,   # H2: Conflict vs. no conflict  
+                        2,  0,  0, -1, -1,   # H3: Conflict (UA vs KZ users) interacts with frame 
+                       -2,  3,  3, -2, -2,   # H4: RU vs. (KZ+UA) x  frame         
+                        0,  0,  0,  1, -1),  # H5: RU vs. UA language x frame for UA users
+                    ncol = 4)
+cor(contr.UNL) # to see correlation
+
+# Use generalized inverse of non-orthogonal set of contrasts
+inv_cntr.UNL <- MASS::fractions(MASS::ginv(t(contr.UNL)))
+contrasts(df$UNL) <-  inv_cntr.UNL
+
+# UNL contrasts
+##  1,2,3,are 4 are between-Subj
+##  1,2,3 are between-Item; 4 is within-Item
+
+# Effect coding contrasts returns ...
+##  ... estimate of the GM in the intercept
+##  ... estimates of the differences between levels as coefficients
+
+#  contr.sum() returns ..
+## ... estimate of the GM in the intercept
+## ... estimates of levels from GM (except for the final level)
+## ... significance values are identical to effect contrasts; only rescaled.
+
+contrasts(df$Frame)  <- (-1)*contr.sum(2)
+contrasts(df$Truth)  <- (-1)*contr.sum(2)  
+contrasts(df$Source) <- (-1)*contr.sum(2)
+
+# Control variables
+contrasts(df$Gen) <- contr.sum(2)
+contrasts(df$Edu) <- contr.sum(6) # "Other" as less interesting category for us
+
+contrasts(df$See) <- (-1)*contr.sum(2) # news seen; "not seen" (0) could be reference
+contrasts(df$Che) <- (-1)*contr.sum(2) # news checked; "not checked" (0 could be reference
+
+mm <- model.matrix(~ 1 + UNL+Frame+p_loy_c+Truth+Source+age_c+ Gen+Edu+See+Che, data=df)
+
+df$unl1 <- mm[,  2]
+df$unl2 <- mm[,  3]
+df$unl3 <- mm[,  4]
+df$unl4 <- mm[,  5]
+df$frm  <- mm[,  6]
+# Note: mm[,  7] is p_loy_c
+df$trth <- mm[,  8]
+df$src  <- mm[,  9]
+# Note: mm[, 10] is age_c
+df$gen <-  mm[, 11]
+df$edu1 <- mm[, 12]
+df$edu2 <- mm[, 13]
+df$edu3 <- mm[, 14]
+df$edu4 <- mm[, 15]
+df$edu5 <- mm[, 16]
+df$see <-  mm[, 17]
+df$che <-  mm[, 18]
+
+#saveRDS(df, file="./data/SCILa_FakeNews_1.rds")  # for input to MixedModels.jl
+```
+
+# Selection of parsimonious LMM
+
+Model selection was based on the following steps.
+
+1. Select variables in theoretical focus and covariates.
+2. Determine the maximum order of fixed-effect interactions for `oviLMM`.
+3. Determine reliable VCs for fixed effects of final `oviLMM`, yielding a `zcpLMM`.
+4. Add CPs to final `zcpLMM`, yielding a `cpxLMM`. 
+
+In principle this is an anti-conservative strategy for selecting fixed effects because the addition of VCs and CPs may render some of them insignificant in the final LMM. Please note:
+
+1. Fixed effects may turn significant after the addition of VCs and CPs. We may have missed some fixed effects and associated VCs and CPS. 
+2. Non-significant fixed effects may still be associated with reliable Subj- and Item-related VCs and CPs. Checking VCs only for fixed-effect terms in the final `oviLMM` may have reliable VC and CPs associated with them.
+3. Dropping unreliable VCs may have turned significant after adding CPs. 
+
+In "defense" of the selection strategy we emphasize that main effects and theoretically motivated interaction terms were kept in the models irrespective of their levels of significance. Potential misses apply only to higher-order interaction terms associated with covariates and contrasts of control variables.
+
+Of course, we check the significance of deleted fixed effects, VC, and CPs by adding them to the final LMM. And there are other ways we could have gone about the model selection. 
+
+**The code for mode selection was moved to the end of the script.**
+
+# Results of LMM 
+
+## Comparison with other LMMs
+
+```{r}
+# Selected LMMs
+load("./fits/m_ovi.rda")
+load("./fits/m_zcp.rda")
+load("./fits/m_cpx.rda")
+load("./fits/m_cpx_subj_all.rda")
+load("./fits/m_cpx_subj_item.rda")
+
+# Model comparisons  - two end points 
+anova(m_ovi, m_zcp, m_cpx, m_cpx_subj_all)
+anova(m_ovi, m_zcp, m_cpx, m_cpx_subj_all, m_cpx_subj_item)
+```
+
+## Model statistics and parameter estimates
+
+We select LMM `m_cpx`.  
+
+```{r}
+print(summary(m_cpx), corr=FALSE)
+
+# next command takes time
+#sjPlot::tab_model(m_ovi, m_zcp, m_cpx, dv.labels=c("ovi", "zcp", "cpx"),
+#        show.ci=FALSE, show.p=TRUE, show.stat =TRUE, show.re.var=FALSE)
+```
+
+## Residual plots
+
+<To be done> 
+
+## Caterpillar plots of conditional modes
+
+<To be done> 
+
+# Interactions related to hypotheses: UNLs x FRAME
+
+## H2: UNL1 x Frame x Truth
+
+Users reading in news about countries with which their own country is in conflict or not, that is 
+
++ not in conflict: `kz ru ru` and `ru kz ru`
++ in conflict: `ru ua ru`, `ua ru ru`, `ua ru ua`
+
+```{r}
+H2 <- 
+  df %>% 
+  mutate(Frame = fct_rev(Frame),
+         Truth = fct_recode(Truth, "Fabricated event (fake news)" = '0', "True event (true news)" = '1'),
+         UNL1 =  fct_collapse(UNL, 'No conflict'= c("kz ru ru",  "ru kz ru"), 
+                                           Conflict = c("ru ua ru",  "ua ru ru", "ua ru ua"))) %>% 
+  group_by(Subj, UNL1, Frame, Truth) %>% 
+  summarise(N=n(), answer_m = mean(answer), .groups="drop") %>% 
+  group_by(UNL1, Frame, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL1, y=M, group=Frame, color=Frame)) +
+  geom_point() + geom_line() + facet_grid(.~Truth) +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Country of user") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Narrative", values=c("red", "blue"), labels=c("dominant", "alternative")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H2
+```
+
+For fabricated news there is support for the hypothesis of an increase in credibility with a dominant narrative when users read news about a country with which their own country is in conflict compared to news about a country with which there is no such conflict. Conflict also induces an opposite effect for the alternative frame. This pattern is not observed for true events.
+
+## H3: UNL2 x Frame 
+
+The effect of narrative type  on news credibility will be greater for respondents from countries that are in the state of conflict seeing news about each other’s countries, as compared to respondents from countries that are not in conflict seeing news about each other’s countries. This is a weak interaction.
+
+```{r }
+H3 <- 
+  df %>% 
+  filter(UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) %>%
+  mutate(Frame = fct_rev(Frame),
+         UNL2 = if_else(UNL == "kz ru ru" , 
+                        "Kazakhstan", "Ukraine")) %>% 
+  group_by(Subj, UNL2, Frame) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>%    
+  group_by(UNL2, Frame) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL2, y=M, group=Frame, color=Frame)) +
+  geom_point() + geom_line() +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Country of user") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Narrative", values=c("red", "blue"), labels=c("dominant", "alternative")) +
+  theme_bw()+
+  theme(legend.position = "none")
+H3
+```
+
+## H4: UNL3 x Frame x loyality
+
+Greater government support (users' self-rated political loyalty) is associated with a greater effect of narrative type on perceived credibility for Russian respondents, but not for respondents residing in Ukraine or Kazakhstan
+
+```{r }
+tblH4 <- 
+  df %>% 
+  mutate(Frame = fct_rev(Frame),
+         UNL3 = as_factor(if_else((UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) , 
+                        "Kazakhstani and Ukrainian user" , "Russian user"))) %>% 
+  group_by(Frame, p_loy, UNL3) %>% 
+  summarise(N=n(), answer=mean(answer))
+  
+H4 <- 
+  df %>% 
+  mutate(Frame = fct_rev(Frame),
+         UNL3 = as_factor(if_else((UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) , 
+                        "Kazakhstani and Ukrainian user" , "Russian user"))) %>%   
+  ggplot(aes(x=p_loy, y=answer, group = Frame, color= Frame)) +
+  geom_smooth(method="lm", formula= y ~ poly(x,1)) +
+  geom_point(data=tblH4) + 
+  facet_grid(. ~ UNL3) +
+  scale_x_continuous("User's support of government (selfrating)", limits=c(1,5) ) +
+  scale_y_continuous("Rating", limits=c(1, 6), breaks=seq(1, 6, .5)) +
+  scale_colour_manual("Narrative", values=c("red", "blue"), labels=c("dominant", "alternative")) +
+  coord_cartesian(xlim=c(1,5), ylim=c(2.5, 4.5)) +
+  theme(legend.position ="none")
+H4
+```
+
+The source of this hypothesis are two specific predictions.
+
+H4a:
+Greater government support is associated with a higher perceived credibility of news items representing a dominant narrative for Russian respondents, but not for respondents residing in Ukraine or Kazakhstan;
+
+H4b: Greater government support is associated with a lower perceived credibility of news items representing an alternative narrative for Russian respondents, but not for respondents residing in Ukraine or Kazakhstan.
+
+```{r}
+H4b <- 
+  df %>% 
+  mutate(Frame = fct_rev(Frame),
+         Truth = fct_recode(Truth, "Fabricated event (fake news)" = '0', "True event (true news)" = '1'),
+         UNL3 = if_else((UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) , 
+                        "Kazakhstan+Ukraine" , "Russia")) %>%   
+  group_by(Subj, UNL3, Frame, Truth) %>% 
+  summarise(N=n(), answer_m = mean(answer), .groups="drop") %>% 
+  group_by(UNL3, Frame, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL3, y=M, group=Frame, color=Frame)) +
+  geom_point() + geom_line() + facet_grid(.~Truth) +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Country of user") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Narrative", values=c("red", "blue"), labels=c("dominant", "alternative")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H4b
+
+#ggsave("./figures/Figure_UNL3xTruthxFrame.png", width=8, height=4)
+#ggsave("./figures/Figure_UNL3xTruthxFrame.pdf", width=8, height=4)
+```
+
+```{r}
+H4c <- 
+  df %>% 
+  mutate(Frame = fct_rev(fct_recode(Frame, dominant = "D", alternative ="A")),
+         Truth = fct_recode(Truth, "Fabricated event (fake news)" = '0', "True event (true news)" = '1'),
+         UNL3 = if_else((UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) , 
+                        "Kazakhstan and Ukraine" , "Russia")) %>%   
+  group_by(Subj, UNL3, Frame, Truth) %>% 
+  summarise(N=n(), answer_m = mean(answer), .groups="drop") %>% 
+  group_by(UNL3, Frame, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=Frame, y=M, group=UNL3, color=UNL3)) +
+  geom_point() + geom_line() + facet_grid(.~Truth) +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Narrative") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Country of user", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H4c
+
+#ggsave("./figures/Figure_FramexUNL3xTruth.png", width=8, height=4)
+#ggsave("./figures/Figure_FramexUNL3xTruth.pdf", width=8, height=4)
+```
+
+
+## H5: UNL4 x Frame 
+
+For Ukrainian respondents, the effect of narrative type on news item credibility is higher if the respondent chooses to read the news in the Ukrainian rather than the Russian language.
+ 
+```{r }
+H5 <- 
+  df %>% 
+  filter(UNL == "ua ru ru"| UNL == "ua ru ua") %>%
+  mutate(Frame = fct_rev(Frame),
+         UNL4 = if_else((UNL == "ua ru ru" ) , "Russian" , "Ukrainian")) %>%   
+  group_by(Subj, UNL4, Frame) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>% 
+  group_by(UNL4, Frame) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL4, y=M, group=Frame, color=Frame)) +
+  geom_point() + geom_line() +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("UA user's language choice") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Narrative", values=c("red", "blue"), labels=c("dominant", "alternative")) +
+  theme(legend.position ="none")
+H5
+```
+
+
+## Composite figure
+
++ Hypothesis H2: top left
++ Hypothesis H3: top right
++ Hypothesis H4: bottom left
++ Hypothesis H5: bottom right
+
+```{r fig.width=7, fig.height=7}
+top_row    <- plot_grid(H2, H3, align = 'h', axis="bt", rel_widths = c(2, 1), 
+                        labels=c("H2", "H3"), label_size = 12)
+bottom_row <- plot_grid(H4, H5, align = 'h', axis="bt", rel_widths = c(2, 1), 
+                        labels=c("H4", "H5"), label_size = 12)
+plot_grid(top_row, bottom_row, ncol=1)
+
+ggsave("./figures/Figure_Hypo.png", width=12, height=8)
+ggsave("./figures/Figure_Hypo.pdf", width=12, height=8)
+```
+
+
+
+
+# Interactions related to research questions
+
+There are three significant interactions relating to manipulations of `Truth` and `Source`.
+
++ UNL4 x Truth x Source  - strong effect
++ UNL1 x Source x Truth  - weak effect
++ UNL3 x Source x Truth  - weak effect
+
+Only the first one is plotted.
+
+## UNL4 x Truth x Source
+
+For Ukrainian respondents who choose to read the news in Ukrainian, the credibility of true news is higher if the news is attributed to a Ukrainian than a Russian source; the reverse is true if the respondent chose to read the news in Russian. For fake news this pattern was not not visible.
+ 
+Three versions of the 3-variable interaction. The first one is chosen for the plot.
+
+```{r }
+H5_src <- 
+  df %>% 
+  filter(UNL == "ua ru ru"| UNL == "ua ru ua") %>%
+  mutate(Truth = fct_recode(Truth, "Fabricated event (fake news)" = '0', "True event (true news)" = '1'),
+         Source = fct_recode(Source, 'Russian news' = "NC", 'Ukrainian news' = "UC"),
+         UNL4 = fct_rev(as_factor(if_else((UNL == "ua ru ru" ) , "Russian" , "Ukrainian")))) %>%   
+  group_by(Subj, UNL4, Truth, Source) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>% 
+  group_by(UNL4, Truth, Source) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=Source, y=M, group=UNL4, color=UNL4)) +
+  geom_point() + geom_line() +
+  facet_grid(.~ Truth, labeller = labeller(Narrative = label_both)) + 
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Source (i.e., news attributed to)") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Language chosen by UA users", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H5_src
+
+ggsave("./figures/Figure_SourcexUNL4xTruth.png", width=8, height=4)
+ggsave("./figures/Figure_SourcexUNL4xTruth..pdf", width=8, height=4)
+```
+
+ 
+```{r }
+H5a_src <- 
+  df %>% 
+  filter(UNL == "ua ru ru"| UNL == "ua ru ua") %>%
+  mutate(Truth = fct_recode(Truth, "Fabricated event (fake news)" = '0', "True event (true news)" = '1'),
+         Source = fct_recode(Source, 'Russian news' = "NC", 'Ukrainian news' = "UC"),
+         UNL4 = if_else((UNL == "ua ru ru" ) , "Russian" , "Ukrainian")) %>%   
+  group_by(Subj, UNL4, Truth, Source) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>% 
+  group_by(UNL4, Truth, Source) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL4, y=M, group=Truth, color=Truth)) +
+  geom_point() + geom_line() +
+  facet_grid(.~ Source, labeller = labeller(Source = label_both)) + 
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("UA user's language choice") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Truth", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H5a_src
+```
+
+
+```{r }
+H5b_src <- 
+  df %>% 
+  filter(UNL == "ua ru ru"| UNL == "ua ru ua") %>%
+  mutate(Truth = fct_recode(Truth, "Fabricated event (fake news)" = '0', "True event (true news)" = '1'),
+         Source = fct_recode(Source, 'Russian news' = "NC", 'Ukrainian news' = "UC"),
+         UNL4 = if_else((UNL == "ua ru ru" ) , "Russian" , "Ukrainian")) %>%   
+  group_by(Subj, UNL4, Truth, Source) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>% 
+  group_by(UNL4, Truth, Source) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL4, y=M, group=Source, color=Source)) +
+  geom_point() + geom_line() +
+  facet_grid(.~ Truth, labeller = labeller(Narrative = label_both)) + 
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("UA user's language choice") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Source", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H5b_src
+```
+
+
+The following two  `Source` effects are quite small. I suspect we get them significant because of the tremendous statistical power we have for within-subject effects. 
+
+## UNL1 x Source x Truth
+
+Users reading in news about countries with which their own country is in conflict or not, that is 
+
++ not in conflict: `kz ru ru` and `ru kz ru`
++ in conflict: `ru ua ru`, `ua ru ru`, `ua ru ua`
+
+```{r}
+H2_src <- 
+  df %>% 
+  mutate(Truth = fct_recode(Truth, "Fabricated news" = '0', "True news" = '1'),
+         UNL1 =  fct_collapse(UNL, 'No conflict'= c("kz ru ru",  "ru kz ru"), 
+                                           Conflict = c("ru ua ru",  "ua ru ru", "ua ru ua"))) %>% 
+  group_by(Subj, UNL1, Source, Truth) %>% 
+  summarise(N=n(), answer_m = mean(answer), .groups="drop") %>% 
+  group_by(UNL1, Source, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL1, y=M, group=Source, color=Source)) +
+  geom_point() + geom_line() + facet_grid(.~Truth) +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Country of user") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Source", values=c("violet", "green"), labels=c("User country", "News Country")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H2_src
+```
+
+## UNL3 x Source x Truth
+
+```{r }
+H4_src <- 
+  df %>% 
+  mutate(Truth = fct_recode(Truth, "Fabricated news" = '0', "True news" = '1'),
+         UNL3 = if_else((UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) , 
+                        "Kazakhstan\nUkraine" , "Russia")) %>%    
+  group_by(Subj, UNL3, Source, Truth) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>% 
+  group_by(UNL3, Source, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=UNL3, y=M, group=Source, color=Source)) +
+  geom_point() + geom_line() +
+  facet_grid( . ~ Truth) +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Country of user") +
+  scale_y_continuous("Rating", limits=c(2.5,4.5), breaks=seq(1,6,.5)) +
+  scale_colour_manual("Source", values=c("violet", "green"), labels=c("News country", "User Country")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99))
+H4_src
+```
+
+
+
+
+# Interactions related to covariates
+
+There is a cluster of main effects and simple interactions with age, gender and education that mainly serves as a treatment check. In other words, they mostly agree with common-sense expectations. The hypotheses in the theoretical focus where tested after statistical adjustment for these effects (and vice versa).
+
+Main effects of `Frame`, `Truth`, `age`, and `education`  (or lack of evidence for them) will be visible in the following simple interaction plots. These are the basic expectations;
+
++ `Frame`: Foreign affairs news items representing a dominant narrative will be perceived as more credible than those representing an alternative narrative.
++ `Truth`: News about true events will be perceived as more credible than fake news.
++ `Source`:  News attributed to a source of the user country will be judged as more credible 
++ `age`:  Credibility ratings will increase with age
++ `gender`:  No expectation of a gender difference
++ `education`: Credibility ratings will decrease with educational level.
++ `See`:  News rated as seen will have higher credibility than news not rated as seen
++ `Che`:  News rated as checked  will have higher credibility than news not rated as checked. 
+
+## `age` and its interactions
+
+### age x Frame
+
+```{r}
+aF <- 
+  df %>% 
+  mutate(Frame = fct_rev(Frame)) %>% 
+  group_by(Subj, Frame) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m, group=Frame, color=Frame) ) + 
+  geom_smooth() + 
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  scale_colour_manual("Narrative", values=c("red", "blue"), label=c("dominant", "alternative")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+aF
+```
+
+check
+
+```{r}
+df %>% 
+  filter(Frame == "A") %>% 
+  group_by(Subj) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m) ) + 
+  geom_smooth() + 
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+```
+
+### age x Truth
+
+```{r}
+aT <- 
+  df %>% 
+  mutate(Truth = fct_rev(Truth)) %>% 
+  group_by(Subj, Truth) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m, group=Truth, color=Truth) ) + 
+  geom_smooth() +
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  scale_colour_manual("News event", values=c("red", "blue"), labels=c("true", "fabricated")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+aT
+```
+
+check
+
+```{r}
+df %>% 
+  filter(Truth == "0") %>% 
+  group_by(Subj) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m) ) + 
+  geom_smooth() + 
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+```
+
+### age x unl1
+
+This interaction is not significant.
+
+```{r}
+a1 <- 
+   df %>% 
+   mutate(UNL1 =  fct_rev(fct_collapse(UNL,  
+                          'No conflict' = c("kz ru ru",  "ru kz ru"), 
+                          'Conflict' = c("ru ua ru",  "ua ru ru", "ua ru ua")))) %>% 
+  group_by(Subj, UNL1) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m, group=UNL1, color=UNL1) ) + 
+  geom_smooth() +
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  scale_colour_manual("Conflict between countries", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+a1
+```
+
+### age x unl2
+
+```{r}
+a2 <- 
+  df %>% 
+  filter(UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) %>%
+  mutate(UNL2 = fct_rev(as_factor(if_else(UNL == "kz ru ru" ,  "Kazakhstan", "Ukraine")))) %>% 
+  group_by(Subj, UNL2) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m, group=UNL2, color=UNL2) ) + 
+  geom_smooth() +
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  scale_colour_manual("User country", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+a2
+```
+
+check 
+
+```{r}
+df %>% 
+  filter(UNL == "kz ru ru") %>% 
+  group_by(Subj) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m) ) + 
+  geom_smooth() +
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+```
+
+### age x unl3
+
+```{r}
+a3 <- 
+  df %>% 
+  mutate(UNL3 = as_factor(if_else((UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) , 
+                        "Kazakhstani+Ukrainian users" , "Russian users"))) %>%   
+  group_by(Subj, UNL3) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m, group=UNL3, color=UNL3) ) + 
+  geom_smooth() +
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  scale_colour_manual("User country", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+a3
+```
+
+### age x unl4 
+
+This interaction is not significant.
+
+```{r}
+a4 <- 
+  df %>% 
+  filter(UNL == "ua ru ru"| UNL == "ua ru ua") %>%
+  mutate( UNL4 = fct_rev(as_factor(if_else((UNL == "ua ru ru" ) , "Russian" , "Ukrainian")))) %>%   
+  group_by(Subj, UNL4) %>% 
+  summarise(N=n(), answer_m=mean(answer), age=first(age), .groups="drop") %>% 
+  ggplot(aes(x=age, y= answer_m, group=UNL4, color=UNL4) ) + 
+  geom_smooth() +
+  scale_x_continuous("Age [years]" ) +
+  scale_y_continuous("Rating", breaks=seq(1,6,.5)) +
+  scale_colour_manual("UA users:\nchosen language", values=c("red", "blue")) +
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+a4
+```
+
+### Composite figure for age
+
+```{r fig.width=12, fig.height=8}
+plot_grid(aT, aF, a2, a3, align = 'h', axis="bt", 
+          labels=c("A", "B", "C", "D"), label_size = 10, ncol=2)
+
+ggsave("./figures/Figure_age.png", width=8, height=8)
+ggsave("./figures/Figure_age.pdf", width=8, height=8)
+```
+
+## Interactions with Seen 
+
+### Seen x UNL1
+
+```{r }
+S1 <- 
+  df %>% 
+  mutate(See = fct_recode(See, no = '0', "yes" = '1'),
+         UNL1 =  fct_rev(fct_collapse(UNL,  
+                          'No conflict' = c("kz ru ru",  "ru kz ru"), 
+                          'Conflict' = c("ru ua ru",  "ua ru ru", "ua ru ua")))) %>% 
+  group_by(Subj, UNL1, See) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>%    
+  group_by(See, UNL1) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=See, y=M, group=UNL1, color=UNL1)) +
+  geom_point() + geom_line() +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("News rated as seeen") +
+  scale_y_continuous("Rating",  breaks=seq(1,6,.5)) +
+  scale_colour_manual("Conflict\nbtw countries", values=c("red", "blue")) +
+  theme_bw()+
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(3,5) )
+S1
+```
+
+### Seen x UNL2
+
+```{r }
+S2 <- 
+  df %>% 
+  filter(UNL == "kz ru ru"| UNL == "ua ru ru" | UNL == "ua ru ua" ) %>%
+  mutate(See = fct_recode(See, no = '0', "yes" = '1'),
+         UNL2 = fct_rev(as_factor(if_else(UNL == "kz ru ru" ,  "Kazakhstan", "Ukraine")))) %>% 
+  group_by(Subj, UNL2, See) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>%    
+  group_by(See, UNL2) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=See, y=M, group=UNL2, color=UNL2)) +
+  geom_point() + geom_line() +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("News rated as seeen") +
+  scale_y_continuous("Rating",  breaks=seq(1,6,.5)) +
+  scale_colour_manual("User country", values=c("red", "blue")) +
+  theme_bw()+
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(3,5) )
+S2
+```
+
+### Composite figure for Seen
+
+```{r}
+plot_grid(S1, S2,  align = 'h', axis="bt",
+         labels=c("A", "B"), label_size = 10,ncol=2)
+ggsave("./figures/Figure_seen.png", width=8, height=4)
+ggsave("./figures/Figure_seen.pdf", width=8, height=4)
+```
+
+
+## Interactions of Truth with Gender and Education (high)
+
+### Truth x Gender
+
+```{r }
+TG <- 
+  df %>% 
+  group_by(Subj, Gen, Truth) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>%    
+  group_by(Gen, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=Truth, y=M, group=Gen, color=Gen)) +
+  geom_point() + geom_line() +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Truth of news",  labels=c("fabricated", "true")) +
+  scale_y_continuous("Rating",  breaks=seq(1,6,.5)) +
+  scale_colour_manual("Gender", values=c("blue", "red"), labels=c("male", "female")) +
+  theme_bw()+
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5,4.5) )
+TG
+```
+
+### Education (high) x Truth
+
+```{r }
+df$Edu <- factor(df$Edu, labels=
+              c("vocational\nschool", "higher\neducation", "university\nstudent",  
+                "graduated\nfrom school", "academic\ndegree", "other"))
+
+tblE <- 
+  df %>% 
+  filter(Truth == "1") %>% 
+  group_by(Edu) %>% summarise(N=n(), nSubj=length(unique(Subj)))
+
+ET <- 
+  df %>% 
+  mutate(Truth = fct_rev(Truth)) %>% 
+  group_by(Subj, Edu, Truth) %>% 
+  summarise(N=n(), answer_m=mean(answer), .groups="drop") %>%    
+  group_by(Edu, Truth) %>% 
+  summarise(N=n(), M=mean(answer_m), SD=sd(answer_m), M_ci = mean_cl_normal(answer_m), .groups="drop") %>% 
+  ggplot(aes(x=Edu, y=M, group=Truth, color=Truth)) +
+  geom_point() + geom_line() +
+  geom_errorbar(aes(ymin=M_ci$ymin, ymax=M_ci$ymax), width=.05) +
+  scale_x_discrete("Education") +
+  scale_y_continuous("Rating",  breaks=seq(1,6,.5)) +
+  scale_colour_manual("Truth of news", values=c("blue", "red"),labels=c("true", "fabricated")) +
+  theme_bw()+
+  theme(legend.position =c(0.01, .99), legend.justification = c(0.01, 0.99)) +
+  coord_cartesian(ylim=c(2.5, 4.5)) +
+  annotate("text", x=1, y=2.65, label="N of users:", size=4) +
+  annotate("text", x=1:6,  y=2.5, label=tblE$nSubj,    size=4)
+ET
+```
+
+### Composite figure for gender and education
+
+```{r fig.width=12, fig.height=4}
+plot_grid(TG, ET,  align = 'h', axis="bt", labels=c("A", "B"), 
+          label_size = 12, ncol=2, rel_widths=c(1,2))
+
+ggsave("./figures/Figure_gen_edu.png", width=8, height=4)
+ggsave("./figures/Figure_gen_edu.pdf", width=8, height=4)
+```
+
+
+
+# Post-hoc LMMs
+
+## Self-rating effects
+
+<To be done> 
+
+## FB vs. VK
+
+<To be done> 
+
+
+# Documentation of model selection
+
+Model selection was based on the following steps.
+
+1. Select variables in theoretical focus and covariates.
+2. Determine the maximum order of fixed-effect interactions for `oviLMM`.
+3. Determine reliable VCs for fixed effects of final `oviLMM`, yielding a `zcpLMM`.
+4. Add CPs to final `zcpLMM`, yielding a `cpxLMM`. 
+
+In principle this is an anti-conservative strategy for selecting fixed effects because the addition of VCs and CPs may render some of them insignificant in the final LMM. Please note:
+
+1. Fixed effects may turn significant after the addition of VCs and CPs. We may have missed some fixed effects and associated VCs and CPS. 
+2. Non-significant fixed effects may still be associated with reliable Subj- and Item-related VCs and CPs. Checking VCs only for fixed-effect terms in the final `oviLMM` may have reliable VC and CPs associated with them.
+3. Dropping unreliable VCs may have turned significant after adding CPs. 
+
+In defense of this strategy we emphasize that main effects and theoretically motivated interaction terms were kept in the models irrespective of their levels of significance. Potential misses apply only to higher-order interaction terms associated with covariates and contrasts of control variables.  
+
+## Determine oviLMM
+
+```{r eval=FALSE, echo=TRUE}
+m_ovi_4 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^4 + age_c+Gen+Edu+See+Che + 
+                        (1 | Subj) + (1 | Item), 
+                        data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_3 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                        (1 | Subj) + (1 | Item), 
+                        data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_2 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^2 + age_c+Gen+Edu+See+Che + 
+                        (1 | Subj) + (1 | Item), 
+                        data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_1 <- lmer(answer ~ 1 +  UNL+Frame+p_loy_c+Truth+Source    + age_c+Gen+Edu+See+Che + 
+                        (1 | Subj) + (1 | Item), 
+                        data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_1, m_ovi_2, m_ovi_3, m_ovi_4)
+```
+
+We definitely start with the third-order model. Let's add  interactions with covariates.
+
+```{r eval=FALSE, echo=TRUE}
+m_ovi_3_ia_1 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                  (UNL+Frame+p_loy_c+Truth+Source):(age_c+Gen+Edu+See+Che) +
+                             (1 | Subj) + (1 | Item), 
+                             data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_3_ia_2 <- lmer(answer ~ 1 +(UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                 (UNL+Frame+p_loy_c+Truth+Source)^2:(age_c+Gen+Edu+See+Che) +
+                             (1 | Subj) + (1 | Item), 
+                             data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_3, m_ovi_3_ia_1, m_ovi_3_ia_2)
+```
+
+We definitely include simple interactions with covariates. Could we simplify the LMM? We drop one covariate interaction at a time to reduce the number of interactions, especially of higher-order interactions.
+
+```{r eval=FALSE, echo=TRUE}
+m_ovi_3_ia_1_age <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                      (UNL+Frame+p_loy_c+Truth+Source):(         Gen+Edu+See+Che) +
+                                 (1 | Subj) + (1 | Item),    
+                                 data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_3_ia_1_Gen <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                      (UNL+Frame+p_loy_c+Truth+Source):(   age_c    +Edu+See+Che) +
+                                 (1 | Subj) + (1 | Item), 
+                                 data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_3_ia_1_Edu <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                      (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen    +See+Che) +
+                                 (1 | Subj) + (1 | Item), 
+                                 data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_3_ia_1_See <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                      (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+Edu    +Che) +
+                                 (1 | Subj) + (1 | Item), 
+                                 data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+m_ovi_3_ia_1_Che <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See+Che + 
+                                      (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+Edu+See    ) +
+                                 (1 | Subj) + (1 | Item), 
+                                 data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+# Test covariate interaction terms
+anova(m_ovi_3_ia_1_age, m_ovi_3_ia_1) # keep
+anova(m_ovi_3_ia_1_Gen, m_ovi_3_ia_1) # keep
+anova(m_ovi_3_ia_1_Edu, m_ovi_3_ia_1) # keep
+anova(m_ovi_3_ia_1_See, m_ovi_3_ia_1) # keep
+anova(m_ovi_3_ia_1_Che, m_ovi_3_ia_1) # drop
+
+# Can we drop some of the covariate main effects?
+m_ovi_3_ia_1_che_che <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+Edu+See + 
+                                          (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+Edu+See) +
+                                     (1 | Subj) + (1 | Item), 
+                                     data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_3_ia_1_che_che,  m_ovi_3_ia_1_Che, m_ovi_3_ia_1)
+```
+
+We stay with `m_ovi_3_ia_1_Che`. Can we get rid of some `Edu` contrasts?
+
+Drop one `edu` contrast at a time.
+
+```{r eval=FALSE, echo=TRUE}
+m_ovi_edu <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2+edu3+edu4+edu5+See+Che+
+                               (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu1+edu2+edu3+edu4+edu5+See) +
+                          (1 | Subj) + (1 | Item), 
+                          data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu, m_ovi_3_ia_1_Che) # ok
+
+m_ovi_edu1 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen     +edu2+edu3+edu4+edu5+See+Che+
+                                (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen     +edu2+edu3+edu4+edu5+See    ) +
+                           (1 | Subj) + (1 | Item),
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+anova(m_ovi_edu1, m_ovi_edu) 
+
+m_ovi_edu2 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1     +edu3+edu4+edu5+See+Che+
+                                (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu1     +edu3+edu4+edu5+See    ) +
+                           (1 | Subj) + (1 | Item), 
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu2, m_ovi_edu) 
+
+m_ovi_edu3 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2    +edu4+edu5+See+Che+
+                                (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu1+edu2    +edu4+edu5+See    ) +
+                           (1 | Subj) + (1 | Item), 
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu3, m_ovi_edu) 
+
+m_ovi_edu4 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2+edu3   +edu5+See+Che+
+                                (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu1+edu2+edu3   +edu5+See    ) +
+                           (1 | Subj) + (1 | Item), 
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu4, m_ovi_edu) 
+
+m_ovi_edu5 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2+edu3+edu4   +See+Che+
+                                (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu1+edu2+edu3+edu4   +See    ) +
+                           (1 | Subj) + (1 | Item), 
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu5, m_ovi_edu) 
+
+m_ovi_edu345 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2          +See+Che+
+                                  (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu1+edu2          +See    ) +
+                             (1 | Subj) + (1 | Item), 
+                             data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu345, m_ovi_edu) 
+
+m_ovi_edu345_1 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2         +See+Che+
+                                    (UNL+Frame+p_loy_c+Truth+Source):(   age_c+Gen+edu2              +See    ) +
+                               (1 | Subj) + (1 | Item), 
+                               data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_edu345_1, m_ovi_edu345, m_ovi_edu) 
+```
+
+Conclusion: `edu3`, `edu4`, `edu5` are fitting noise in general; we possibly could also drop interactions with `edu1`, but leave the term in LMM.
+
+Let's check some of the interactions between variables in the theoretical focus and covariates. The covariate `p_loy_c` is a prime suspect, but we keep interaction terms related to hypotheses.
+
+```{r eval=FALSE, echo=TRUE}
+ m_ovi_x <- m_ovi_edu345
+
+m_ovi_x1 <- lmer(answer ~ 1 + (UNL+Frame+p_loy_c+Truth+Source)^3 + age_c+Gen+edu1+edu2+See+Che+
+                              (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                         (1 | Subj) + (1 | Item), 
+                         data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+anova(m_ovi_x1, m_ovi_x)
+
+m_ovi_x2 <- lmer(answer ~ 1 + (UNL+Frame+        Truth+Source)^3 + p_loy_c*UNL*Frame + age_c+Gen+edu1+edu2+See+Che +
+                              (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                         (1 | Subj) + (1 | Item), 
+                         data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+
+anova(m_ovi_x2, m_ovi_x1, m_ovi_x)
+
+# We select LMM m_ovi_x2 
+m_ovi <- m_ovi_x2
+```
+
+Indeed, `p_loy_c` interacts only with `UNL` and `Frame` -- as expected.
+
+## Determine zcpLMM
+
+We add VCs to LMM `m_ovi`. 
+
+```{r eval=FALSE, echo=TRUE}
+m_zcp <- lmer(answer ~ 1 + (UNL+Frame+Truth+Source)^3 + p_loy_c*UNL*Frame + 
+                            age_c+Gen+edu1+edu2+See+Che + (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                      (1 + frm + trth + src + see + che || Subj) + 
+                      (1 + unl4 + src + p_loy_c + age_c + gen + edu1 + edu2 + see + che || Item), 
+                      data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(rePCA(m_zcp))  # looks good
+VarCorr(m_zcp)
+
+m_zcp1 <- lmer(answer ~ 1 + (UNL+Frame+Truth+Source)^3 + p_loy_c*UNL*Frame + 
+                            age_c+Gen+edu1+edu2+See+Che + (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                       (1 + frm + trth + see  || Subj) + 
+                       (1 + unl4 + p_loy_c + gen + edu1 + edu2 + see + che || Item), 
+                       data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(rePCA(m_zcp1))
+VarCorr(m_zcp1)
+
+anova(m_zcp1, m_zcp)
+
+m_zcp2 <- lmer(answer ~ 1 + (UNL+Frame+Truth+Source)^3 + p_loy_c*UNL*Frame + 
+                            age_c+Gen+edu1+edu2+See+Che + (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                       (1 + frm + trth + see + che || Subj) + 
+                       (1 + unl4 + p_loy_c + gen + edu1 + edu2 + see + che || Item), 
+                       data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(rePCA(m_zcp2))
+VarCorr(m_zcp2)
+
+anova(m_zcp2, m_zcp1, m_zcp)
+
+# We select LMM m_zcp2
+m_zcp <- m_zcp2
+```
+
+## Determine cpxLMM
+
+Do we need to add CPs to the zcpLMM? 
+
+### CPs for Subj
+  
+```{r eval=FALSE, echo=TRUE}
+m_cpx_subj_all <- lmer(answer ~ 1 + (UNL+Frame+Truth+Source)^3 + p_loy_c*UNL*Frame + 
+                            age_c+Gen+edu1+edu2+See+Che + (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                           (1 + frm + trth + see + che | Subj) + 
+                           (1 + unl4 + p_loy_c + gen + edu1 + edu2 + see + che || Item), 
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(rePCA(m_cpx_subj_all))
+VarCorr(m_cpx_subj_all)
+anova(m_ovi, m_zcp, m_cpx_subj_all)
+
+# remove non-identified GM-related CPs (identified in MixedModels.jl)
+m_cpx_subj <- lmer(answer ~ 1 + (UNL+Frame+Truth+Source)^3 + p_loy_c*UNL*Frame + 
+                            age_c+Gen+edu1+edu2+See+Che + (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                           (1 | Subj)  + (0 + frm + trth + see + che  | Subj) + 
+                           (1 + unl4 + p_loy_c + gen + edu1 + edu2 + see + che || Item), 
+                           data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(rePCA(m_cpx_subj))
+VarCorr(m_cpx_subj)
+
+anova(m_ovi, m_zcp, m_cpx_subj, m_cpx_subj_all)
+```
+
+### CPs for Subj and Item
+
+Here we add CPs for `Item` to the previous LMM. 
+  
+```{r eval=FALSE, echo=TRUE}
+m_cpx_subj_item <- lmer(answer ~ 1 + (UNL+Frame+Truth+Source)^3 + p_loy_c*UNL*Frame + 
+                              age_c+Gen+edu1+edu2+See+Che + (UNL+Frame+Truth):(age_c+Gen+edu1+edu2+See) +
+                        (1  | Subj) + (0 + frm + trth + see + che | Subj) + 
+                        (1 + unl4 + p_loy_c + gen + edu1 + edu2 + see + che | Item), 
+                        data=df, REML=FALSE, control=lmerControl(calc.derivs=FALSE)) 
+summary(rePCA(m_cpx_subj_item))
+VarCorr(m_cpx_subj_item)
+
+anova(m_zcp, m_cpx_subj, m_cpx_subj_all)
+anova(m_zcp, m_cpx_subj, m_cpx_subj_item)
+
+m_cpx <- m_cpx_subj
+```
+
+ 
+
+# Appendix
+
+```{r}
+sessionInfo
+```
